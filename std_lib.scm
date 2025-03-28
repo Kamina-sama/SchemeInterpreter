@@ -36,6 +36,7 @@
 (define odd? (lambda (n) (not (even? n))))
 (define != (lambda (n1 n2) (not (= n1 n2))))
 (define sqrt (lambda (n) (expt n 0.5)))
+
 (define first car)
 (define second (lambda (ls) (car (cdr ls))))
 (define third (lambda (ls) (car (cdr (cdr ls)))))

@@ -89,6 +89,7 @@ class Env:
         env.symbols['quote'] = QuoteProc()
         env.symbols['quasiquote'] = QuasiquoteProc()
         env.symbols['eval'] = EvalProc()
+        env.symbols['apply'] = ApplyProc()
         env.symbols['list?'] = IsListProc()
         env.symbols['pair?'] = IsPairProc()
         env.symbols['list'] = ListProc()
@@ -210,6 +211,12 @@ class Procedure(SEXPR):
         self.special_form = False
         self.closure_env = {}
         self.closure_symbols = set()
+        self.variadic = False
+        if len(self.params)>=2:
+            maybe_dot = self.params[-2]
+            self.variadic = (maybe_dot.identifier == '.')
+        if self.variadic:
+            self.variadic_param = self.params[-1]
     """
         if self.identifier:
             return f'procedure:{self.identifier}({len(self.params)})'
@@ -228,8 +235,16 @@ class Procedure(SEXPR):
             env.pop_stack_frame()
     def apply(self, args: list[SEXPR], env: Env, tail_call_optimized = False):
         
-        current_bindings = {p.identifier:a for p,a in zip(self.params, args)}
-        
+        current_bindings = {}
+        if not self.variadic:
+            current_bindings = {p.identifier:a for p,a in zip(self.params, args)}
+        else:
+            non_variadic_params = self.params[:-2]
+            non_variadic_arg_length = len(non_variadic_params)
+            current_bindings = {p.identifier:a for p,a in zip(non_variadic_params, args)}
+            variadic_args = args[non_variadic_arg_length:]
+            current_bindings[self.variadic_param.identifier] = List(variadic_args)
+
         if not tail_call_optimized or len(env.stack)==0:
             env.push_stack_frame(current_bindings)
         else:
@@ -527,12 +542,6 @@ class LambdaProc(Procedure):
         body = args[1:]
         
         proc = Procedure(param_list, body, 'lambda')
-        
-        """
-        If param_list has a Symbol dot . and another generic symbol as the last two symbols
-        Then it is variadic, mark it as such in proc somehow
-        """
-        
         """
         if the lambda is being called in a local scope (procedure being created inside another procedure call),
         if the body contains a symbol that is defined in the immediate local scope and that is not in the parameter list, then
@@ -631,7 +640,6 @@ class EvalProc(Procedure):
             return arg.evaluate(env)
         quoted_arg = arg.children[1]
         return quoted_arg.evaluate(env)
-    
 class CarProc(Procedure):
     def __init__(self):
         self.identifier = 'car'
@@ -931,6 +939,23 @@ class VoidProc(Procedure):
         if len(args)!=0:
             raise Exception("void requires exactly 0 arguments")
         return None
+class ApplyProc(Procedure):
+    def __init__(self):
+        self.identifier = 'apply'
+        self.special_form = False
+    def apply(self, args: list[SEXPR], env: Env):
+        if len(args)<2:
+            raise Exception("apply requires at least 2 arguments")
+        func: Procedure = args[0]
+        if not isinstance(func, Procedure):
+            raise Exception('apply first argument must be a procedure')
+        ls: List = args[-1]
+        if not isinstance(ls, List):
+            raise Exception('apply last argument must be a list')
+        rest: list[SEXPR] = args[1:-1]
+        to_apply = rest
+        to_apply.extend(ls.children)
+        return func.apply(to_apply, env)
 
 repl_env = Env.make_repl_env()
 
@@ -973,7 +998,7 @@ def read(text: str):
                     tokens.append(t)
                     i+=1
                 continue
-            if t=='.':
+            if t=='.' and not inside_string and not text[i-1].isdigit() and not text[i+1].isdigit():
                 tokens.append(t)
                 i+=1
                 continue
@@ -1153,7 +1178,7 @@ def load_lib(lib_path: str):
     commands = []
 
 def main():
-    #load_lib("std_lib.scm")
+    load_lib("std_lib.scm")
     while True:
         try:
             rep()
