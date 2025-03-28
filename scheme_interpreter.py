@@ -5,10 +5,13 @@ Created on Wed Mar 26 14:08:52 2025
 @author: LREIS24
 """
 import re
+import sys
 from sys import exit
 from abc import ABC
 from copy import deepcopy
 import inspect
+
+sys.setrecursionlimit(10000)
 
 #Where symbols and their values as ASTs (Abstract Syntax Trees, or since we are dealign with LISP, Symbolic Expressions, or S-expressions, or SEXPRs) will be stored. There are both global and locals scopes
 class Env:
@@ -42,7 +45,10 @@ class Env:
     def replace_stack_frame(self, stack_frame):
         self.stack[-1] = stack_frame
     def merge_stack_frame(self, stack_frame):
-        self.stack[-1].update(stack_frame)
+        if len(self.stack)==0:
+            self.stack.append(stack_frame)
+        else:
+            self.stack[-1].update(stack_frame)
     def pop_stack_frame(self):
         self.stack.pop()
     def get_current_frame(self):
@@ -63,7 +69,8 @@ class Env:
         env.symbols['integer->char'] = IntToCharProc()
         env.symbols['equal?'] = EqualProc()
         env.symbols['define'] = DefineProc()
-        env.symbols['set!'] = DefineProc(True)
+        env.symbols['set!'] = DefineProc(overwrite=True)
+        env.symbols['define-macro'] = DefineProc(macro_definition=True)
         env.symbols['if'] = IfProc()
         env.symbols['cond'] = CondProc()
         env.symbols['lambda'] = LambdaProc()
@@ -103,6 +110,8 @@ class Env:
         env.symbols['begin'] = BeginProc()
         env.symbols['load'] = LoadProc()
         env.symbols['void'] = VoidProc()
+        #env.symbols['open-input-file'] = OpenInputFileProc()
+        #env.symbols['close-port'] = ClosePortProc()
         #env.symbols['read-char'] = ReadCharProc()
         #env.symbols['call-with-input-file'] = CWIFProc()
         #env.symbols['eof-object?'] = IsEOFObjectProc()
@@ -110,8 +119,9 @@ class Env:
         return env
 
 class SEXPR(ABC):
-    def __init__(self, parent = None):
-        self.parent = parent
+    def __init__(self):
+        #self.parent = parent
+        pass
     def evaluate(self, env):
         return self
     def partial_evaluate(self, env):
@@ -124,8 +134,8 @@ class List(SEXPR):
     def __init__(self, children: list[SEXPR], improper = False):
         super().__init__()
         self.improper = improper
-        for child in children:
-            child.parent = self
+        #for child in children:
+            #child.parent = self
         self.children = children
     def evaluate(self, env):
         if len(self.children)==0:
@@ -135,7 +145,7 @@ class List(SEXPR):
             raise Exception("First element of list is not a procedure, cannot evaluate")
         args = []
         for c in self.children[1:]:
-            args.append(c if fun_to_call.special_form else c.evaluate(env)) #"special form" means the procedure needs more control of how their arguments are evaluated...
+            args.append(c if (fun_to_call.special_form or fun_to_call.macro) else c.evaluate(env)) #"special form" means the procedure needs more control of how their arguments are evaluated...
         return fun_to_call.apply(args, env)
     def partial_evaluate(self, env):
         if len(self.children)==0:
@@ -204,14 +214,17 @@ class Symbol(Atom):
         return self.identifier == symbol_id
 
 class Procedure(SEXPR):
+    def set_attributes(self, special_form: bool, variadic: bool, macro: bool):
+        self.special_form = special_form
+        self.variadic = variadic
+        self.macro = macro
     def __init__(self, params: list[Symbol], body: list[SEXPR], identifier = ''):
         self.identifier = identifier
         self.body = body
         self.params = params
-        self.special_form = False
+        self.set_attributes(False, False, False)
         self.closure_env = {}
         self.closure_symbols = set()
-        self.variadic = False
         if len(self.params)>=2:
             maybe_dot = self.params[-2]
             self.variadic = (maybe_dot.identifier == '.')
@@ -224,9 +237,11 @@ class Procedure(SEXPR):
             return f'procedure:lambda({len(self.params)})' """
     def update_closure_env(self, env: Env):
         for s in self.closure_symbols:
-            self.closure_env[s] = env.get_current_frame()[s]
-    def apply_closure_env(self, env: Env):
-        env.merge_stack_frame(self.closure_env)
+            frame = env.get_current_frame()
+            if s in frame: #if this procedure's stack frame no longer exists (replaced by TCO), then we cannot be sure the symbol is here
+                self.closure_env[s] = frame[s]
+    def apply_closure_env(self, bindings: dict[str, SEXPR]):
+        bindings.update(self.closure_env)
     def proc_exit(self, tail_call_optimized: bool, env: Env):
         self.update_closure_env(env)
         #only pop the frame if it belongs to the function originally 
@@ -234,7 +249,6 @@ class Procedure(SEXPR):
         if not tail_call_optimized:
             env.pop_stack_frame()
     def apply(self, args: list[SEXPR], env: Env, tail_call_optimized = False):
-        
         current_bindings = {}
         if not self.variadic:
             current_bindings = {p.identifier:a for p,a in zip(self.params, args)}
@@ -243,13 +257,22 @@ class Procedure(SEXPR):
             non_variadic_arg_length = len(non_variadic_params)
             current_bindings = {p.identifier:a for p,a in zip(non_variadic_params, args)}
             variadic_args = args[non_variadic_arg_length:]
-            current_bindings[self.variadic_param.identifier] = List(variadic_args)
+            vargs = List(variadic_args)
+            current_bindings[self.variadic_param.identifier] = vargs if not self.macro else List([Symbol('quote'), vargs])
+        self.apply_closure_env(current_bindings)
+        
+        #env.push_stack_frame(current_bindings)
+        #last_val = None
+        #body = self.body
+        #for b in body:
+        #    last_val = b.evaluate(env)
+        #self.proc_exit(False, env)
+        #return last_val if not self.macro else EvalProc().apply([last_val], env)
 
         if not tail_call_optimized or len(env.stack)==0:
             env.push_stack_frame(current_bindings)
         else:
             env.replace_stack_frame(current_bindings)
-        self.apply_closure_env(env)
         
         body = self.body
         for b in body[:-1]:
@@ -258,23 +281,24 @@ class Procedure(SEXPR):
         
         is_tail_call = isinstance(tail, List) and len(tail.children)>0
         tail_func = tail.children[0].evaluate(env) if is_tail_call else None
-        is_tail_call = is_tail_call and isinstance(tail_func, Procedure) and not tail_func.special_form 
+        is_tail_call = is_tail_call and isinstance(tail_func, Procedure) and not tail_func.special_form
+        
+        last_val = None
         if is_tail_call:
             tail_args = [a.evaluate(env) for a in tail.children[1:]]
             how_many_args = len(inspect.signature(tail_func.apply).parameters)
             accepts_tail_call_arg = how_many_args == 3
             last_val = tail_func.apply(tail_args, env, True) if accepts_tail_call_arg else tail_func.apply(tail_args, env)
-            self.proc_exit(tail_call_optimized, env)
-            return last_val
-        
-        last_val = tail.evaluate(env)
+        else:
+            last_val = tail.evaluate(env)
         self.proc_exit(tail_call_optimized, env)
-        return last_val
+        
+        return last_val if not self.macro else EvalProc().apply([last_val], env)
     
 class AddProc(Procedure):
     def __init__(self):
         self.identifier = '+'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         num = Number(0)
         for a in args:
@@ -285,7 +309,7 @@ class AddProc(Procedure):
 class MulProc(Procedure):
     def __init__(self):
         self.identifier = '*'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         num = Number(1)
         for a in args:
@@ -296,7 +320,7 @@ class MulProc(Procedure):
 class ExptProc(Procedure):
     def __init__(self):
         self.identifier = 'expt'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=2:
             raise Exception('expt requires exactly 2 arguments')
@@ -308,7 +332,7 @@ class ExptProc(Procedure):
 class ModuloProc(Procedure):
     def __init__(self):
         self.identifier = 'modulo'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=2:
             raise Exception("modulo requires exactly 2 arguments")
@@ -321,7 +345,7 @@ class ModuloProc(Procedure):
 class IsStringProc(Procedure):
     def __init__(self):
         self.identifier = 'string?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string? requires exactly 2 arguments")
@@ -330,7 +354,7 @@ class IsStringProc(Procedure):
 class IsCharProc(Procedure):
     def __init__(self):
         self.identifier = 'char?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("char? requires exactly 2 arguments")
@@ -339,7 +363,7 @@ class IsCharProc(Procedure):
 class IsBoolProc(Procedure):
     def __init__(self):
         self.identifier = 'bool?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("bool? requires exactly 2 arguments")
@@ -348,7 +372,7 @@ class IsBoolProc(Procedure):
 class IsNumberProc(Procedure):
     def __init__(self):
         self.identifier = 'number?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("number? requires exactly 2 arguments")
@@ -357,7 +381,7 @@ class IsNumberProc(Procedure):
 class IsListProc(Procedure):
     def __init__(self):
         self.identifier = 'list?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("list? requires exactly 2 arguments")
@@ -366,7 +390,7 @@ class IsListProc(Procedure):
 class IsPairProc(Procedure):
     def __init__(self):
         self.identifier = 'pair?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("pair? requires exactly 2 arguments")
@@ -375,7 +399,7 @@ class IsPairProc(Procedure):
 class MinusProc(Procedure):
     def __init__(self):
         self.identifier = '-'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception("Expected at least one argument")
@@ -393,7 +417,7 @@ class MinusProc(Procedure):
 class SmallerThanProc(Procedure):
     def __init__(self):
         self.identifier = '<'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)<2:
             raise Exception("< needs at least two arguments")
@@ -407,7 +431,7 @@ class SmallerThanProc(Procedure):
 class BiggerThanProc(Procedure):
     def __init__(self):
         self.identifier = '>'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)<2:
             raise Exception("> needs at least two arguments")
@@ -421,7 +445,7 @@ class BiggerThanProc(Procedure):
 class DivProc(Procedure):
     def __init__(self):
         self.identifier = '/'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception("Expected at least one argument")
@@ -439,25 +463,49 @@ class DivProc(Procedure):
 class WriteProc(Procedure):
     def __init__(self):
         self.identifier = 'display'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("Display procedure expects exactly 1 argument")
         toDisplay = args[0]
-        print_scheme(toDisplay, False)
+        val = print_scheme(toDisplay)
+        print(val, end='')
         return None
 class DefineProc(Procedure):
-    def __init__(self, overwrite = False):
+    def __init__(self, overwrite = False, macro_definition = False):
         self.identifier = 'define'
-        self.special_form = True
+        self.macro_definition = macro_definition
         self.overwrite = overwrite
+        self.set_attributes(True, False, False)
+    def undo_procedure_syntatic_sugar(self, args: list[SEXPR]):
+        function_signature: List = args[0]
+        if len(function_signature.children) == 0:
+            raise Exception('define procedure needs an identifier')
+        func_identifier: Symbol = function_signature.children[0]
+        if not isinstance(func_identifier, Symbol):
+            raise Exception('define procedure\'s first argument must be a list that has a symbol to serve as an identifier as first element')
+            
+        param_list: list[SEXPR] = function_signature.children[1:]
+        body: list[SEXPR] = args[1:]
+        lambda_call: list[SEXPR] = [Symbol('lambda'), List(param_list)]
+        lambda_call.extend(body)
+        return [func_identifier, List(lambda_call)]
     def apply(self, args: list[SEXPR], env: Env):
+        symb = args[0]
+
+        #Treat for procedure definitions
+        if isinstance(symb, List):
+            args = self.undo_procedure_syntatic_sugar(args)
+            symb = args[0]
+        
+        if not isinstance(symb, Symbol):
+            raise Exception('define first argument must be a symbol')
         if len(args)!=2:
             raise Exception("Define expects exactly 2 arguments")
-        symb = args[0]
         val = args[1].evaluate(env)
         if isinstance(val, Procedure):
             val: Procedure = val
+            val.macro = self.macro_definition
             val.identifier = symb.identifier
             if len(env.stack)>0:
                 val.closure_symbols.add(symb.identifier)
@@ -469,14 +517,14 @@ class DefineProc(Procedure):
                 raise Exception('Cannot redefine a variable (use "set!")')
         else:
             if symb.identifier not in env.stack[-1] or self.overwrite:
-                env.stack[-1][symb.identifier] = val
+                env.get_current_frame()[symb.identifier] = val
             else:
                 raise Exception('Cannot redefine a variable (use "set!")')
         return None
 class IfProc(Procedure):
     def __init__(self):
         self.identifier = 'if'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)<2:
             raise Exception("If expects at least 2 arguments (predicate and then clause)")
@@ -494,7 +542,7 @@ class IfProc(Procedure):
 class CondProc(Procedure):
     def __init__(self):
         self.identifier = 'cond'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception("cond expects at least 1 argument")
@@ -518,7 +566,7 @@ class CondProc(Procedure):
 class EqualProc(Procedure):
     def __init__(self):
         self.identifier = 'equal?'
-        self.special_form= False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args) != 2:
             raise Exception("equal? requires exactly 2 arguments")
@@ -528,7 +576,7 @@ class EqualProc(Procedure):
 class LambdaProc(Procedure):
     def __init__(self):
         self.identifier = 'lambda'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args) < 2:
             raise Exception("Lambda needs at least 2 args: a parameter list and a body expression")
@@ -561,13 +609,13 @@ class LambdaProc(Procedure):
 class ExitProc(Procedure):
     def __init__(self):
         self.identifier = 'exit'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         exit(0)
 class SymbolEqualProc(Procedure):
     def __init__(self):
         self.identifier = '='
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception("= Needs at least 1 argument")
@@ -586,7 +634,7 @@ class SymbolEqualProc(Procedure):
 class NotProc(Procedure):
     def __init__(self):
         self.identifier = 'not'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("Not needs exactly 1 argument")
@@ -598,7 +646,7 @@ class NotProc(Procedure):
 class NewLineProc(Procedure):
     def __init__(self):
         self.identifier = 'neline'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=0:
             raise Exception('newline does not receive any argument')
@@ -606,7 +654,7 @@ class NewLineProc(Procedure):
 class QuoteProc(Procedure):
     def __init__(self):
         self.identifier = 'quote'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('quote only receives 1 argument')
@@ -615,7 +663,7 @@ class QuoteProc(Procedure):
 class QuasiquoteProc(Procedure):
     def __init__(self):
         self.identifier = 'quasiquote'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('quote only receives 1 argument')
@@ -624,7 +672,7 @@ class QuasiquoteProc(Procedure):
 class EvalProc(Procedure):
     def __init__(self):
         self.identifier = 'eval'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('eval receives exactly 1 argument')
@@ -643,7 +691,7 @@ class EvalProc(Procedure):
 class CarProc(Procedure):
     def __init__(self):
         self.identifier = 'car'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('car only receives 1 argument')
@@ -657,7 +705,7 @@ class CarProc(Procedure):
 class CdrProc(Procedure):
     def __init__(self):
         self.identifier = 'cdr'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('cdr only receives 1 argument')
@@ -671,7 +719,7 @@ class CdrProc(Procedure):
 class StringAppendProc(Procedure):
     def __init__(self):
         self.identifier = 'string-append'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         val = String('')
         for a in args:
@@ -682,7 +730,7 @@ class StringAppendProc(Procedure):
 class StringEqualProc(Procedure):
     def __init__(self):
         self.identifier = 'string=?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception('string=? expects at least 2 arguments')
@@ -696,7 +744,7 @@ class StringEqualProc(Procedure):
 class CharEqualProc(Procedure):
     def __init__(self):
         self.identifier = 'char=?'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)==0:
             raise Exception('char=? expects at least 2 arguments')
@@ -710,7 +758,7 @@ class CharEqualProc(Procedure):
 class ConsProc(Procedure):
     def __init__(self):
         self.identifier = 'cons'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=2:
             raise Exception("cons require exactly 2 arguments")
@@ -726,7 +774,7 @@ class ConsProc(Procedure):
 class AppendProc(Procedure):
     def __init__(self):
         self.identifier = 'append'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         appended_lists = List([])
         for a in args:
@@ -737,7 +785,7 @@ class AppendProc(Procedure):
 class ReverseProc(Procedure):
     def __init__(self):
         self.identifier = 'reverse'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception('reverse requires exacly 1 argument')
@@ -748,7 +796,7 @@ class ReverseProc(Procedure):
 class StringLengthProc(Procedure):
     def __init__(self):
         self.identifier = 'string-length'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string-length requires exactly 1 argument")
@@ -759,7 +807,7 @@ class StringLengthProc(Procedure):
 class StringRefProc(Procedure):
     def __init__(self):
         self.identifier = 'string-ref'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=2:
             raise Exception("string-length requires exactly 2 arguments")
@@ -773,13 +821,13 @@ class StringRefProc(Procedure):
 class ListProc(Procedure):
     def __init__(self):
         self.identifier = 'list'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         return List(args)
 class BeginProc(Procedure):
     def __init__(self):
         self.identifier = 'begin'
-        self.special_form = True
+        self.set_attributes(True, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         last_val = None
         for a in args:
@@ -788,7 +836,7 @@ class BeginProc(Procedure):
 class ListRefProc(Procedure):
     def __init__(self):
         self.identifier = 'list-ref'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=2:
             raise Exception('list-ref requires exactly 2 arguments (a list and an index)')
@@ -802,7 +850,7 @@ class ListRefProc(Procedure):
 class LengthProc(Procedure):
     def __init__(self):
         self.identifier = 'length'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("length requires exactly 1 argument")
@@ -813,7 +861,7 @@ class LengthProc(Procedure):
 class StringToListProc(Procedure):
     def __init__(self):
         self.identifier = 'string->list'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string->list requires exactly 1 argument")
@@ -825,7 +873,7 @@ class StringToListProc(Procedure):
 class StringUpcaseProc(Procedure):
     def __init__(self):
         self.identifier = 'string-upcase'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string-upcase requires exactly 1 argument")
@@ -836,7 +884,7 @@ class StringUpcaseProc(Procedure):
 class StringDowncaseProc(Procedure):
     def __init__(self):
         self.identifier = 'string-downcase'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string-downcase requires exactly 1 argument")
@@ -847,7 +895,7 @@ class StringDowncaseProc(Procedure):
 class CharUpcaseProc(Procedure):
     def __init__(self):
         self.identifier = 'char-upcase'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("char-upcase requires exactly 1 argument")
@@ -858,7 +906,7 @@ class CharUpcaseProc(Procedure):
 class CharDowncaseProc(Procedure):
     def __init__(self):
         self.identifier = 'char-upcase'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("char-upcase requires exactly 1 argument")
@@ -869,7 +917,7 @@ class CharDowncaseProc(Procedure):
 class StringToNumberProc(Procedure):
     def __init__(self):
         self.identifier = 'string->number'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("string->number requires exactly 1 argument")
@@ -885,7 +933,7 @@ class StringToNumberProc(Procedure):
 class NumberToStringProc(Procedure):
     def __init__(self):
         self.identifier = 'number->string'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("number->string requires exactly 1 argument")
@@ -896,7 +944,7 @@ class NumberToStringProc(Procedure):
 class IntToCharProc(Procedure):
     def __init__(self):
         self.identifier = 'integer->char'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("integer->char requires exactly 1 argument")
@@ -907,7 +955,7 @@ class IntToCharProc(Procedure):
 class CharToIntProc(Procedure):
     def __init__(self):
         self.identifier = 'char->integer'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("char->integer requires exactly 1 argument")
@@ -918,7 +966,7 @@ class CharToIntProc(Procedure):
 class LoadProc(Procedure):
     def __init__(self):
         self.identifier = 'load'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=1:
             raise Exception("load requires exactly 1 argument")
@@ -929,12 +977,12 @@ class LoadProc(Procedure):
         with open(fpath, 'r') as file:
             content = file.read().strip()
             content = f'(begin {content})'
-            rep(content)
+            evaluate(read(content), env)
         return None
 class VoidProc(Procedure):
     def __init__(self):
         self.identifier = 'void'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)!=0:
             raise Exception("void requires exactly 0 arguments")
@@ -942,7 +990,7 @@ class VoidProc(Procedure):
 class ApplyProc(Procedure):
     def __init__(self):
         self.identifier = 'apply'
-        self.special_form = False
+        self.set_attributes(False, False, False)
     def apply(self, args: list[SEXPR], env: Env):
         if len(args)<2:
             raise Exception("apply requires at least 2 arguments")
@@ -976,7 +1024,7 @@ def read(text: str):
                     acc = ''
                 i+=1
                 continue
-            if t in ['(', ')', '[', ']']:
+            if t in ['(', ')', '[', ']'] and not inside_string:
                 if acc!='':
                     tokens.append(acc)
                     acc = ''
@@ -986,11 +1034,11 @@ def read(text: str):
                     acc+=t
                 i+=1
                 continue
-            if t == "'" or t == '`':
+            if t == "'" or t == '`' and not inside_string:
                 tokens.append(t)
                 i+=1
                 continue
-            if t == ',':
+            if t == ',' and not inside_string:
                 if text[i+1]=='@':
                     tokens.append(text[i:i+2])
                     i+=2
@@ -1094,45 +1142,50 @@ def read(text: str):
 def evaluate(ast, env):
     return ast.evaluate(env)
 
-def print_scheme(value, add_newline = True):
-    def print_atom_ast(ast: Atom):
+def print_scheme(value):
+    from io import StringIO
+    
+    def print_atom_ast(ast: Atom, output: StringIO):
         if isinstance(ast, Number):
             num: Number = ast
-            print(num.num, end='')
+            output.write(str(num.num))
         elif isinstance(ast, Bool):
             b: Bool = ast
-            print('#t' if b.val else '#f', end='')
+            output.write('#t' if b.val else '#f')
         elif isinstance(ast, Char):
             c: Char = ast
-            print(f'#\\{c.char}', end='')
+            output.write(f'#\\{c.char}')
         elif isinstance(ast, String):
             text: String = ast
-            print(f'"{text.text}"', end='')
-        else:
+            output.write(f'"{text.text}"')
+        elif isinstance(ast, Symbol):
             s: Symbol = ast
-            print(s.identifier, end = '')
-    def print_list_ast(ast: List):
-        print('(', end='')
+            output.write(s.identifier)
+    def print_list_ast(ast: List, output: StringIO):
+        output.write('(')
         amount = len(ast.children)
         for idx,c in enumerate(ast.children):
-            print_ast(c, False)
-            print(' ' if idx != amount - 1 else '', end='')
+            print_ast(c, output)
+            if idx != amount - 1:
+                output.write(' ')
             if ast.improper and idx == amount-2:
-                print('.', end=' ')
-        print(')', end='')
-    def print_ast(ast, add_newline):
+                output.write('. ')
+        output.write(')')
+    def print_ast(ast, output: StringIO):
         if ast is None:
             return
         if isinstance(ast, Atom):
-            print_atom_ast(ast)
+            print_atom_ast(ast, output)
         elif isinstance(ast, Procedure):
-            print(f'procedure:{ast.identifier}', end='')
+            output.write(f'procedure:{ast.identifier}')
         elif isinstance(ast, List):
-            print_list_ast(ast)
-        else:
-            pass
-        print('') if add_newline else None
-    print_ast(value, add_newline)
+            print_list_ast(ast, output)
+        
+    output = StringIO()
+    print_ast(value, output)
+    value = output.getvalue()
+    output.close()
+    return value
 
 commands = []
 previous_is_complete_command = True
@@ -1149,7 +1202,7 @@ def get_current_command(commands, previous_is_complete_command: bool):
         text_input = commands[-1] + ' ' + new_input
     return text_input
 
-def rep(command = ''):
+def rep(command = '', dont_store_command = False):
     global previous_is_complete_command
     text_input = get_current_command(commands, previous_is_complete_command) if not command else command
     ast = read(text_input)
@@ -1170,15 +1223,16 @@ def rep(command = ''):
     previous_is_complete_command = True
     
     v = evaluate(ast, repl_env)
-    print_scheme(v)
+    print(print_scheme(v))
 
 def load_lib(lib_path: str):
     global commands
-    rep(f'(load "{lib_path}")')
+    evaluate(read(f'(load "{lib_path}")'), repl_env)
     commands = []
 
 def main():
     load_lib("std_lib.scm")
+    load_lib("test.scm")
     while True:
         try:
             rep()
